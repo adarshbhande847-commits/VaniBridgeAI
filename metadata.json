@@ -1,0 +1,5 @@
+{
+  "name": "VaniBridge AI",
+  "description": "An automated video dubbing tool for rural education using Gemini models for transcription, translation, and speech generation.",
+  "requestFramePermissions": []
+}
