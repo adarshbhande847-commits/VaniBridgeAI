@@ -14,7 +14,7 @@ export enum TargetLanguage {
 
 export enum InputMode {
   FILE = 'FILE',
-  YOUTUBE = 'YOUTUBE'
+  URL = 'URL'
 }
 
 export enum Voice {
@@ -30,7 +30,7 @@ export interface ProcessingState {
   inputMode: InputMode;
   isMockMode: boolean;
   videoFile: File | null;
-  youtubeUrl: string;
+  youtubeUrl: string; // Keep this for backward compatibility or rename to inputUrl
   youtubeId: string | null;
   videoUrl: string | null;
   detectedLanguage: string | null;

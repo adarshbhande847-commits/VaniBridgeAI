@@ -1,8 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { TargetLanguage, ProcessingState, AppStep, InputMode, Voice } from './types';
-import { detectAndTranscribe, translateText, generateSpeechData, generateGenericTranscript, analyzeYouTubeUrl, generateSRT } from './services/geminiService';
+import { detectAndTranscribe, translateText, generateSpeechData, generateGenericTranscript, analyzeUrl, generateSRT, setCustomApiKey } from './services/geminiService';
 import { UploadIcon, PlayIcon, PauseIcon, LoadingSpinner, YouTubeIcon, LinkIcon, VolumeIcon, DownloadIcon, SkipBackIcon, SkipForwardIcon, SubtitleIcon } from './components/Icon';
 import { ProcessingLog } from './components/ProcessingLog';
+import { auth, db, loginWithGoogle, logout, collection, addDoc, query, where, orderBy, onSnapshot, serverTimestamp, onAuthStateChanged, User } from './firebase';
+import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
 const MAX_FILE_SIZE = 2000 * 1024 * 1024; 
 
@@ -61,6 +64,14 @@ const App: React.FC = () => {
   const [currentPlaybackTime, setCurrentPlaybackTime] = useState<number>(0);
   const [duration, setDuration] = useState<number>(0);
   const [isDownloadingVideo, setIsDownloadingVideo] = useState<boolean>(false);
+  const [user, setUser] = useState<User | null>(null);
+  const [history, setHistory] = useState<any[]>([]);
+  const [showHistory, setShowHistory] = useState<boolean>(false);
+  const [isLoggingIn, setIsLoggingIn] = useState<boolean>(false);
+  const [showSettings, setShowSettings] = useState<boolean>(false);
+  const [apiKeyInput, setApiKeyInput] = useState<string>(localStorage.getItem('gemini_api_key') || '');
+  const [ffmpegLoaded, setFfmpegLoaded] = useState(false);
+  const ffmpegRef = useRef(new FFmpeg());
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
@@ -70,16 +81,73 @@ const App: React.FC = () => {
   const currentTimeRef = useRef<number>(0);
   const isSeekingRef = useRef<boolean>(false);
 
-  // Initialize AudioContext
+  // Initialize AudioContext and FFmpeg
   useEffect(() => {
+    const loadFFmpeg = async () => {
+      const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
+      const ffmpeg = ffmpegRef.current;
+      
+      // Add message listener for progress
+      ffmpeg.on('log', ({ message }) => {
+        console.log("FFmpeg Log:", message);
+      });
+
+      try {
+        await ffmpeg.load({
+          coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+          wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+        });
+        setFfmpegLoaded(true);
+      } catch (err) {
+        console.error("Failed to load FFmpeg:", err);
+      }
+    };
+
+    loadFFmpeg();
+
+    if (apiKeyInput) {
+      setCustomApiKey(apiKeyInput);
+    }
+
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+    });
+    
     const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
     const gainNode = ctx.createGain();
     gainNode.gain.value = 1.0; 
     gainNode.connect(ctx.destination);
     audioContextRef.current = ctx;
     gainNodeRef.current = gainNode;
-    return () => { audioContextRef.current?.close(); };
+    
+    return () => { 
+      unsubscribe();
+      audioContextRef.current?.close(); 
+    };
   }, []);
+
+  // Fetch History
+  useEffect(() => {
+    if (!user) {
+      setHistory([]);
+      return;
+    }
+    
+    const q = query(
+      collection(db, 'lessons'),
+      where('uid', '==', user.uid),
+      orderBy('createdAt', 'desc')
+    );
+    
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setHistory(docs);
+    }, (error) => {
+      console.error("History fetch error:", error);
+    });
+    
+    return () => unsubscribe();
+  }, [user]);
 
   // YouTube Message Listener for Sync
   useEffect(() => {
@@ -140,12 +208,34 @@ const App: React.FC = () => {
     }
   }, [previewMode, volume, state.youtubeId, state.step, isPlaying]);
 
+  // Sync players on mode change
+  useEffect(() => {
+    if (state.step === AppStep.RESULT && isPlaying) {
+      const syncTime = currentTimeRef.current;
+      if (previewMode === 'original' && state.youtubeId && iframeRef.current) {
+        iframeRef.current.contentWindow?.postMessage(JSON.stringify({ event: 'command', func: 'seekTo', args: [syncTime, true] }), '*');
+        iframeRef.current.contentWindow?.postMessage(JSON.stringify({ event: 'command', func: 'playVideo' }), '*');
+      } else if (previewMode === 'original' && state.videoUrl && videoRef.current) {
+        videoRef.current.currentTime = syncTime;
+        videoRef.current.play().catch(e => console.error("Video play failed:", e));
+      }
+    }
+  }, [previewMode, state.step, isPlaying, state.youtubeId, state.videoUrl]);
+
   const handlePause = React.useCallback(async () => {
-    await audioContextRef.current?.suspend();
-    videoRef.current?.pause();
-    iframeRef.current?.contentWindow?.postMessage(JSON.stringify({ event: 'command', func: 'pauseVideo' }), '*');
+    if (audioContextRef.current?.state === 'running') {
+      await audioContextRef.current.suspend();
+    }
+    
+    if (videoRef.current) {
+      videoRef.current.pause();
+    }
+
+    if (state.youtubeId) {
+      iframeRef.current?.contentWindow?.postMessage(JSON.stringify({ event: 'command', func: 'pauseVideo' }), '*');
+    }
     setIsPlaying(false);
-  }, []);
+  }, [state.youtubeId]);
 
   // Playback Loop
   useEffect(() => {
@@ -247,16 +337,20 @@ const App: React.FC = () => {
     if (!url) return null;
     const cleanUrl = url.trim();
 
-    // Test Cases Handled:
-    // 1. Standard: https://www.youtube.com/watch?v=dQw4w9WgXcQ
-    // 2. Shortened: https://youtu.be/dQw4w9WgXcQ
-    // 3. Embed: https://www.youtube.com/embed/dQw4w9WgXcQ
-    // 4. Shorts: https://www.youtube.com/shorts/dQw4w9WgXcQ
-    // 5. Params: https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=4s
+    // Comprehensive regex for various YouTube URL formats:
+    // - Standard: https://www.youtube.com/watch?v=dQw4w9WgXcQ
+    // - Shortened: https://youtu.be/dQw4w9WgXcQ
+    // - Embed: https://www.youtube.com/embed/dQw4w9WgXcQ
+    // - Shorts: https://www.youtube.com/shorts/dQw4w9WgXcQ
+    // - Live: https://www.youtube.com/live/dQw4w9WgXcQ
+    // - Mobile: https://m.youtube.com/watch?v=dQw4w9WgXcQ
+    // - With params: https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=4s
     
-    const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=|shorts\/)([^#&?]*).*/;
+    const regExp = /^.*(?:(?:youtu\.be\/|v\/|vi\/|u\/\w\/|embed\/|shorts\/|live\/)|(?:(?:watch)?\?v(?:i)?=|\&v(?:i)?=))([^#\&\?]*).*/;
     const match = cleanUrl.match(regExp);
-    return (match && match[2].length === 11) ? match[2] : null;
+    
+    const id = (match && match[1].length === 11) ? match[1] : null;
+    return id;
   };
 
   const handleChangeKey = async () => {
@@ -266,8 +360,44 @@ const App: React.FC = () => {
      }
   };
 
-  const startProcessing = async () => {
-    setState(prev => ({ ...prev, step: AppStep.PROCESSING, isProcessing: true, progress: 0, statusMessage: "Initializing..." }));
+  const startProcessing = async (overrideIsMockMode?: boolean) => {
+    // Validation
+    if (state.inputMode === InputMode.FILE && !state.videoFile) {
+        const msg = "Please upload a video file before generating.";
+        addLog(msg);
+        setState(p => ({ ...p, statusMessage: "Failed", logs: [...p.logs, msg] }));
+        return;
+    }
+    if (state.inputMode === InputMode.URL && !state.youtubeUrl.trim()) {
+        const msg = "Please provide a YouTube URL or MP4 link before generating.";
+        addLog(msg);
+        setState(p => ({ ...p, statusMessage: "Failed", logs: [...p.logs, msg] }));
+        return;
+    }
+
+    const isMock = overrideIsMockMode !== undefined ? overrideIsMockMode : state.isMockMode;
+    
+    // Proactive API Key check if not in mock mode
+    if (!isMock && (window as any).aistudio) {
+        try {
+            const hasKey = await (window as any).aistudio.hasSelectedApiKey();
+            if (!hasKey) {
+                await (window as any).aistudio.openSelectKey();
+                // Proceed assuming selection was successful as per guidelines
+            }
+        } catch (e) {
+            console.warn("API Key check failed:", e);
+        }
+    }
+    
+    setState(prev => ({ 
+      ...prev, 
+      step: AppStep.PROCESSING, 
+      isProcessing: true, 
+      progress: 0, 
+      statusMessage: "Initializing...",
+      isMockMode: isMock // Sync the state if overridden
+    }));
     setIsPlaying(false);
     currentTimeRef.current = 0;
     setCurrentPlaybackTime(0);
@@ -280,24 +410,34 @@ const App: React.FC = () => {
         let currentTranscript = "";
         let currentLanguage = "English";
 
-        if (state.inputMode === InputMode.YOUTUBE) {
+        if (state.inputMode === InputMode.URL) {
             const url = state.youtubeUrl.trim();
-            if (!url) throw new Error("Please enter a valid YouTube URL.");
+            if (!url) throw new Error("Please enter a valid URL.");
             
+            const isMp4 = url.toLowerCase().endsWith('.mp4');
             const ytid = getYouTubeId(url);
-            if (!ytid) {
-                throw new Error("Invalid YouTube URL. Could not extract Video ID. Please ensure the URL is correct.");
+            
+            if (!ytid && !isMp4) {
+                throw new Error("Invalid URL. Please provide a valid YouTube link or a direct MP4 URL.");
             }
             
             // Set ID initially and clear previous video file data to avoid conflicts
-            setState(p => ({...p, youtubeId: ytid, videoUrl: null, videoFile: null}));
+            setState(p => ({...p, youtubeId: ytid, videoUrl: isMp4 ? url : null, videoFile: null}));
 
             // 2. Analyze
-            setState(p => ({...p, progress: 10, statusMessage: "Analyzing YouTube content..."}));
+            setState(p => ({...p, progress: 10, statusMessage: `Analyzing ${isMp4 ? 'MP4' : 'YouTube'} content...`}));
             
-            const analysisResult = await analyzeYouTubeUrl(url);
-            currentTranscript = analysisResult.transcript;
-            currentLanguage = analysisResult.language || "English";
+            try {
+                const analysisResult = await analyzeUrl(url);
+                currentTranscript = analysisResult.transcript;
+                currentLanguage = analysisResult.language || "English";
+            } catch (error) {
+                console.warn("URL analysis failed, falling back to generic transcript:", error);
+                addLog("URL analysis failed. Generating generic transcript...");
+                const genericResult = await generateGenericTranscript();
+                currentTranscript = genericResult.transcript;
+                currentLanguage = genericResult.language || "English";
+            }
             
             // Update state with the results for the next steps
             setState(p => ({
@@ -336,24 +476,27 @@ const App: React.FC = () => {
         const wavUrl = createWavUrl(audioData);
         await decodeAudio(audioData);
 
-        // 5. Finalize
-        if (!state.isMockMode) {
-            const hasValidKey = (window as any).aistudio ? await (window as any).aistudio.hasSelectedApiKey() : true;
-            if (hasValidKey) {
-                setState(p => ({...p, progress: 90, statusMessage: "Generating Veo Lip-sync..."}));
-                addLog("Veo video generation started (High Quality)...");
-                // In a real implementation, we would call ai.models.generateVideos here
-                await new Promise(r => setTimeout(r, 2000));
-                addLog("Veo video generation completed.");
-            } else {
-                addLog("Skipping Veo video generation: No valid paid API key selected.");
-                setState(p => ({...p, progress: 90, statusMessage: "Skipping Veo (No API Key)..."}));
-                await new Promise(r => setTimeout(r, 1000));
-            }
-        }
-
         setState(p => ({...p, progress: 100, statusMessage: "Finalizing...", audioUrl: wavUrl}));
         await new Promise(r => setTimeout(r, 1000));
+        
+        // Save to Firebase if logged in
+        if (user) {
+          try {
+            await addDoc(collection(db, 'lessons'), {
+              uid: user.uid,
+              title: state.videoFile?.name || (state.youtubeId ? `YouTube: ${state.youtubeId}` : "Untitled Lesson"),
+              sourceUrl: state.youtubeUrl || "",
+              targetLanguage: targetLang,
+              transcript: currentTranscript,
+              translatedText: translated,
+              createdAt: serverTimestamp()
+            });
+            addLog("Lesson saved to your history.");
+          } catch (error) {
+            console.error("Error saving lesson:", error);
+            addLog("Failed to save lesson to history.");
+          }
+        }
         
         setState(p => ({...p, step: AppStep.RESULT, isProcessing: false, statusMessage: "Ready"}));
 
@@ -362,53 +505,75 @@ const App: React.FC = () => {
         console.error(err);
         
         const errMsg = err.message.toLowerCase();
-        const isAuthError = errMsg.includes("permission denied") || 
-            errMsg.includes("403") || 
-            errMsg.includes("not found") ||
-            errMsg.includes("authentication failed") ||
-            errMsg.includes("api key") ||
-            errMsg.includes("failed to fetch");
+        let status = "Failed";
+        let logMsg = `Error: ${err.message}`;
 
-        if (isAuthError) {
-             if ((window as any).aistudio) {
-                 addLog("Authentication/Billing Error. Please check your key.");
-                 setState(p => ({...p, isProcessing: false, statusMessage: "Auth Error", logs: [...p.logs, "Error: Authentication failed."] }));
-             } else {
-                 setState(p => ({...p, isProcessing: false, statusMessage: "Auth Error", logs: [...p.logs, `Permission Denied: ${err.message}`] }));
-             }
-        } else {
-             setState(p => ({...p, isProcessing: false, statusMessage: "Failed", logs: [...p.logs, `Error: ${err.message}`] }));
+        if (errMsg.includes("permission denied") || errMsg.includes("403") || errMsg.includes("authentication failed") || errMsg.includes("api key") || errMsg.includes("invalid api key") || errMsg.includes("key required") || errMsg.includes("requested entity was not found")) {
+            status = "Auth Error";
+            logMsg = "Authentication failed or Permission Denied. This often happens if the API key is invalid or lacks necessary permissions. Please select a valid Paid API Key to continue.";
+            handleChangeKey();
+        } else if (errMsg.includes("video inaccessible") || errMsg.includes("private") || errMsg.includes("restricted") || errMsg.includes("deleted")) {
+            status = "Video Error";
+            logMsg = `URL Error: ${err.message}. You can try using 'Mock Mode' (Settings) to simulate the process with generic content.`;
+        } else if (errMsg.includes("quota") || errMsg.includes("rate limit") || errMsg.includes("429") || errMsg.includes("too many requests")) {
+            status = "Rate Limit";
+            logMsg = "Rate limit exceeded. Please wait a moment and try again.";
+        } else if (errMsg.includes("safety") || errMsg.includes("blocked") || errMsg.includes("content filter")) {
+            status = "Safety Block";
+            logMsg = "Content blocked by safety filters. Please try a different video.";
+        } else if (errMsg.includes("unsupported") || errMsg.includes("mime type") || errMsg.includes("format") || errMsg.includes("invalid file")) {
+            status = "Format Error";
+            logMsg = "Unsupported file format. Please use a standard video file (MP4, MOV).";
+        } else if (errMsg.includes("overloaded") || errMsg.includes("503") || errMsg.includes("busy") || errMsg.includes("internal error")) {
+            status = "Server Busy";
+            logMsg = "The AI model is currently overloaded. Please try again in a few seconds.";
+        } else if (errMsg.includes("failed to fetch") || errMsg.includes("network")) {
+            status = "Network Error";
+            logMsg = "Network error. Please check your internet connection.";
         }
+
+        addLog(logMsg);
+        setState(p => ({ ...p, isProcessing: false, statusMessage: status, logs: [...p.logs, logMsg] }));
     }
   };
 
-  // Playback Controls
-  const togglePlayback = async () => {
-     if (isPlaying) {
-         await handlePause();
-     } else {
-         if (audioContextRef.current?.state === 'suspended') await audioContextRef.current.resume();
-         
-         // Start Audio
-         if (audioBuffer && !sourceNodeRef.current && state.step === AppStep.RESULT) {
-             const src = audioContextRef.current!.createBufferSource();
-             src.buffer = audioBuffer;
-             src.connect(gainNodeRef.current || audioContextRef.current!.destination);
-             src.start(0, currentTimeRef.current);
-             src.onended = () => { if(!isSeekingRef.current) setIsPlaying(false); };
-             sourceNodeRef.current = src;
-         }
-         
-         videoRef.current?.play();
-         if (state.youtubeId) {
-             iframeRef.current?.contentWindow?.postMessage(JSON.stringify({ event: 'command', func: 'seekTo', args: [currentTimeRef.current, true] }), '*');
-             iframeRef.current?.contentWindow?.postMessage(JSON.stringify({ event: 'command', func: 'playVideo' }), '*');
-         }
-         setIsPlaying(true);
-     }
+  const resetApp = () => {
+    if (sourceNodeRef.current) {
+      try { sourceNodeRef.current.stop(); } catch (e) {}
+      sourceNodeRef.current = null;
+    }
+    setIsPlaying(false);
+    setAudioBuffer(null);
+    setCurrentPlaybackTime(0);
+    currentTimeRef.current = 0;
+    setDuration(0);
+    setState({
+      step: AppStep.UPLOAD,
+      inputMode: InputMode.FILE,
+      isMockMode: true,
+      videoFile: null,
+      youtubeUrl: '',
+      youtubeId: null,
+      videoUrl: null,
+      detectedLanguage: null,
+      transcript: '',
+      translatedText: '',
+      audioUrl: null,
+      isProcessing: false,
+      progress: 0,
+      logs: [],
+      statusMessage: "Ready"
+    });
   };
 
-  const handleSeek = (time: number) => {
+// Playback Controls
+  const formatTime = (s: number) => {
+      const m = Math.floor(s / 60);
+      const sec = Math.floor(s % 60);
+      return `${m}:${sec.toString().padStart(2, '0')}`;
+  };
+
+  const handleSeek = React.useCallback((time: number) => {
       isSeekingRef.current = true;
       const t = Math.max(0, Math.min(time, duration || 100));
       currentTimeRef.current = t;
@@ -427,16 +592,71 @@ const App: React.FC = () => {
           src.buffer = audioBuffer;
           src.connect(gainNodeRef.current || audioContextRef.current!.destination);
           src.start(0, t);
+          src.onended = () => { 
+              sourceNodeRef.current = null;
+              if(!isSeekingRef.current) setIsPlaying(false); 
+          };
           sourceNodeRef.current = src;
       }
       setTimeout(() => isSeekingRef.current = false, 50);
-  };
+  }, [duration, isPlaying, audioBuffer, state.step, state.youtubeId]);
 
-  const formatTime = (s: number) => {
-      const m = Math.floor(s / 60);
-      const sec = Math.floor(s % 60);
-      return `${m}:${sec.toString().padStart(2, '0')}`;
-  };
+  const togglePlayback = React.useCallback(async () => {
+      if (isPlaying) {
+          await handlePause();
+      } else {
+          // Reset if at end
+          if (duration > 0 && currentTimeRef.current >= duration - 0.1) {
+              handleSeek(0);
+          }
+
+          if (audioContextRef.current?.state === 'suspended') {
+              await audioContextRef.current.resume();
+          }
+          
+          // Start Audio if not already playing or if it was stopped
+          if (audioBuffer && !sourceNodeRef.current && state.step === AppStep.RESULT) {
+              const src = audioContextRef.current!.createBufferSource();
+              src.buffer = audioBuffer;
+              src.connect(gainNodeRef.current || audioContextRef.current!.destination);
+              src.start(0, currentTimeRef.current);
+              src.onended = () => { 
+                  sourceNodeRef.current = null;
+                  if(!isSeekingRef.current) setIsPlaying(false); 
+              };
+              sourceNodeRef.current = src;
+          }
+          
+          if (videoRef.current) {
+              videoRef.current.play().catch(e => console.error("Video play failed:", e));
+          }
+          
+          if (state.youtubeId) {
+              iframeRef.current?.contentWindow?.postMessage(JSON.stringify({ event: 'command', func: 'seekTo', args: [currentTimeRef.current, true] }), '*');
+              iframeRef.current?.contentWindow?.postMessage(JSON.stringify({ event: 'command', func: 'playVideo' }), '*');
+          }
+          setIsPlaying(true);
+      }
+  }, [isPlaying, handlePause, handleSeek, audioBuffer, state.step, state.youtubeId, duration]);
+
+  // Keyboard Shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.code === 'Space') {
+        // Prevent scrolling if not typing in an input
+        if (document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'TEXTAREA') {
+          e.preventDefault();
+          togglePlayback();
+        }
+      } else if (e.code === 'ArrowLeft') {
+        handleSeek(currentTimeRef.current - 5);
+      } else if (e.code === 'ArrowRight') {
+        handleSeek(currentTimeRef.current + 5);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [togglePlayback, handleSeek]);
 
   const handleReset = () => {
       setState(p => ({...p, step: AppStep.UPLOAD, transcript: '', translatedText: '', audioUrl: null, logs: [], progress: 0, statusMessage: "Ready" }));
@@ -457,58 +677,82 @@ const App: React.FC = () => {
   };
 
   const handleDownloadVideo = async () => {
-    if (!state.audioUrl || (!state.youtubeId && !state.videoFile)) {
+    if (!state.audioUrl || (!state.youtubeId && !state.videoFile && !state.videoUrl)) {
       alert("Please generate the dubbed audio first and ensure a video is selected.");
       return;
     }
 
     setIsDownloadingVideo(true);
-    addLog("Preparing high-quality video export...");
+    addLog("Preparing high-quality video export locally...");
 
     try {
-      // 1. Fetch the audio blob
+      if (!ffmpegLoaded) {
+        throw new Error("Video processing engine is still loading. Please wait a moment.");
+      }
+
+      const ffmpeg = ffmpegRef.current;
+
+      // 1. Get Audio Data
+      addLog("Fetching dubbed audio...");
       const audioResponse = await fetch(state.audioUrl);
       const audioBlob = await audioResponse.blob();
+      await ffmpeg.writeFile('audio.mp3', await fetchFile(audioBlob));
 
-      // 2. Prepare Form Data
-      const formData = new FormData();
-      formData.append("audio", audioBlob, "dubbed_audio.wav");
+      // 2. Get Video Data
+      addLog("Fetching video source...");
+      let videoData: Uint8Array;
       
-      if (state.youtubeId) {
-        formData.append("youtubeId", state.youtubeId);
-      } else if (state.videoFile) {
-        formData.append("video", state.videoFile);
+      if (state.videoFile) {
+        videoData = await fetchFile(state.videoFile);
+      } else if (state.videoUrl) {
+        // Direct MP4 URL
+        const videoResponse = await fetch(state.videoUrl);
+        const videoBlob = await videoResponse.blob();
+        videoData = await fetchFile(videoBlob);
+      } else if (state.youtubeId) {
+        throw new Error("Direct YouTube downloads are not supported in serverless mode. Please upload the video file directly to use the 'Download Dubbed Video' feature.");
+      } else {
+        throw new Error("No video source found for merging.");
       }
 
-      // 3. Send to Server for merging
-      addLog(state.youtubeId ? "Merging audio with high-quality YouTube stream..." : "Merging audio with uploaded video file...");
-      const response = await fetch("/api/merge-video", {
-        method: "POST",
-        body: formData,
-      });
+      await ffmpeg.writeFile('video.mp4', videoData);
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || "Failed to merge video");
-      }
+      // 3. Run FFmpeg Merge
+      addLog("Merging audio and video locally (this happens on your device and is 100% free)...");
+      
+      // Command: ffmpeg -i video.mp4 -i audio.mp3 -c:v copy -c:a aac -map 0:v:0 -map 1:a:0 -shortest output.mp4
+      await ffmpeg.exec([
+        '-i', 'video.mp4',
+        '-i', 'audio.mp3',
+        '-c:v', 'copy',
+        '-c:a', 'aac',
+        '-map', '0:v:0',
+        '-map', '1:a:0',
+        '-shortest',
+        'output.mp4'
+      ]);
 
-      // 4. Download the result
-      const videoBlob = await response.blob();
-      const videoUrl = URL.createObjectURL(videoBlob);
-      const a = document.createElement("a");
-      a.href = videoUrl;
-      const downloadName = state.youtubeId ? `VaniBridge_Dubbed_${state.youtubeId}.mp4` : `VaniBridge_Dubbed_${state.videoFile?.name || 'video'}.mp4`;
+      const data = await ffmpeg.readFile('output.mp4');
+      const dubbedBlob = new Blob([data], { type: 'video/mp4' });
+      const dubbedUrl = URL.createObjectURL(dubbedBlob);
+
+      const a = document.createElement('a');
+      a.href = dubbedUrl;
+      
+      let downloadName = "VaniBridge_Dubbed_Video.mp4";
+      if (state.videoFile) downloadName = `VaniBridge_Dubbed_${state.videoFile.name.split('.')[0]}.mp4`;
+      
       a.download = downloadName;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      URL.revokeObjectURL(videoUrl);
-      
-      addLog("Video exported successfully!");
+      URL.revokeObjectURL(dubbedUrl);
+
+      addLog("Download complete! Enjoy your localized video.");
     } catch (error) {
-      console.error("Download error:", error);
-      alert(`Export failed: ${(error as Error).message}`);
-      addLog(`Export failed: ${(error as Error).message}`);
+      console.error("Merge error:", error);
+      addLog(`Error: ${error instanceof Error ? error.message : "Failed to merge video locally"}`);
+      alert(error instanceof Error ? error.message : "Failed to merge video locally");
     } finally {
       setIsDownloadingVideo(false);
     }
@@ -534,14 +778,107 @@ const App: React.FC = () => {
                 <p className="text-xs text-slate-400 font-medium tracking-wide">AI VIDEO LOCALIZATION</p>
              </div>
           </div>
-          <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/10 bg-white/5 backdrop-blur-sm">
-             <span className={`status-dot ${state.isProcessing ? 'processing animate-pulse' : 'live'}`}></span>
-             <span className="text-xs font-medium text-slate-300">{state.isProcessing ? 'Processing' : 'Live Inference'}</span>
+          <div className="flex items-center gap-4">
+             {user ? (
+               <div className="flex items-center gap-3">
+                 <button 
+                   onClick={() => setShowHistory(!showHistory)}
+                   className="text-xs font-bold text-slate-400 hover:text-cyan-300 transition-colors"
+                 >
+                   History ({history.length})
+                 </button>
+                 <div className="flex items-center gap-2">
+                   <img src={user.photoURL || ""} alt={user.displayName || ""} className="w-8 h-8 rounded-full border border-white/10" />
+                   <button onClick={logout} className="text-xs font-bold text-red-400 hover:text-red-300">Logout</button>
+                   <button 
+                     onClick={() => setShowSettings(true)}
+                     className="hidden sm:flex p-2 rounded-lg hover:bg-white/5 text-slate-400 transition-colors"
+                     title="Settings"
+                   >
+                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                   </button>
+                 </div>
+               </div>
+             ) : (
+               <button 
+                 onClick={async () => {
+                   if (isLoggingIn) return;
+                   setIsLoggingIn(true);
+                   try {
+                     await loginWithGoogle();
+                   } catch (e) {
+                     // Error handled in firebase.ts
+                   } finally {
+                     setIsLoggingIn(false);
+                   }
+                 }}
+                 disabled={isLoggingIn}
+                 className="px-4 py-2 rounded-xl bg-white/5 border border-white/10 text-xs font-bold hover:bg-white/10 transition-all disabled:opacity-50"
+               >
+                 {isLoggingIn ? 'Logging in...' : 'Login'}
+               </button>
+             )}
+             <button 
+                onClick={() => setShowSettings(true)}
+                className="p-2 rounded-lg hover:bg-white/5 text-slate-400 transition-colors sm:hidden"
+             >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+             </button>
+             <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/10 bg-white/5 backdrop-blur-sm">
+                <span className={`status-dot ${state.isProcessing ? 'processing animate-pulse' : 'live'}`}></span>
+                <span className="text-xs font-medium text-slate-300">{state.isProcessing ? 'Processing' : 'Live Inference'}</span>
+             </div>
           </div>
         </div>
       </header>
 
       <main className="relative z-10 max-w-7xl mx-auto px-6 py-8">
+        {showHistory && (
+          <section className="glass rounded-2xl p-6 mb-8 animate-fadeIn">
+            <div className="flex items-center justify-between mb-6">
+              <h2 className="text-xl font-bold text-white">Lesson History</h2>
+              <button onClick={() => setShowHistory(false)} className="text-slate-400 hover:text-white">Close</button>
+            </div>
+            {history.length === 0 ? (
+              <p className="text-slate-500 text-center py-8">No lessons saved yet. Generate your first regional lesson!</p>
+            ) : (
+              <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                {history.map((item) => (
+                  <div key={item.id} className="bg-white/5 border border-white/10 rounded-xl p-4 hover:border-cyan-500/30 transition-all group">
+                    <div className="flex justify-between items-start mb-2">
+                      <h3 className="text-sm font-bold text-slate-200 truncate pr-4">{item.title}</h3>
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-400">{item.targetLanguage}</span>
+                    </div>
+                    <p className="text-[10px] text-slate-500 mb-3">
+                      {item.createdAt?.toDate ? item.createdAt.toDate().toLocaleDateString() : 'Just now'}
+                    </p>
+                    <div className="flex gap-2">
+                      <button 
+                        onClick={() => {
+                          setState(p => ({
+                            ...p,
+                            step: AppStep.RESULT,
+                            transcript: item.transcript,
+                            translatedText: item.translatedText,
+                            detectedLanguage: 'English',
+                            statusMessage: 'Ready'
+                          }));
+                          setTargetLang(item.targetLanguage);
+                          setShowHistory(false);
+                          addLog(`Loaded lesson: ${item.title}`);
+                        }}
+                        className="text-[10px] font-bold text-cyan-400 hover:underline"
+                      >
+                        View Details
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
+
         <div className="grid lg:grid-cols-2 gap-8 items-start">
           
           {/* LEFT COLUMN: Controls & Input */}
@@ -555,9 +892,9 @@ const App: React.FC = () => {
                         className={`px-3 py-1 text-xs font-medium rounded-md transition-all ${state.inputMode === InputMode.FILE ? 'bg-slate-700 text-cyan-300 shadow-sm' : 'text-slate-400 hover:text-white'}`}
                       >File</button>
                       <button 
-                        onClick={() => setState(p => ({...p, inputMode: InputMode.YOUTUBE}))}
-                        className={`px-3 py-1 text-xs font-medium rounded-md transition-all ${state.inputMode === InputMode.YOUTUBE ? 'bg-slate-700 text-red-400 shadow-sm' : 'text-slate-400 hover:text-white'}`}
-                      >YouTube</button>
+                        onClick={() => setState(p => ({...p, inputMode: InputMode.URL}))}
+                        className={`px-3 py-1 text-xs font-medium rounded-md transition-all ${state.inputMode === InputMode.URL ? 'bg-slate-700 text-red-400 shadow-sm' : 'text-slate-400 hover:text-white'}`}
+                      >URL</button>
                    </div>
                 </div>
 
@@ -589,10 +926,13 @@ const App: React.FC = () => {
                              }));
                            }}
                            className="field w-full rounded-lg py-3 pl-10 pr-4 text-sm focus:bg-slate-900/50"
-                           placeholder="https://youtube.com/watch?v=..."
+                           placeholder="YouTube link or direct MP4 URL..."
                          />
                          <div className="absolute left-3 top-3 text-slate-500"><LinkIcon /></div>
                       </div>
+                      <p className="text-[10px] text-slate-500 mt-2 flex items-center gap-1">
+                        <YouTubeIcon size={12} /> Supports YouTube, Shorts, and direct .mp4 links
+                      </p>
                    </div>
                 )}
             </div>
@@ -625,36 +965,68 @@ const App: React.FC = () => {
                 
                 {/* Mock Mode Toggle */}
                 <div className="flex items-center justify-between field rounded-lg p-2 bg-slate-900/50 mb-2">
-                   <span className="text-xs text-slate-300 ml-1">Mock Lip-Sync</span>
+                   <span className="text-xs text-slate-300 ml-1">Mock Mode</span>
                    <div 
                      className={`toggle ${state.isMockMode ? 'active' : ''}`}
-                     onClick={() => setState(p => ({...p, isMockMode: !p.isMockMode}))}
+                     onClick={() => setState(p => ({...p, isMockMode: !p.isMockMode, statusMessage: p.statusMessage === "Auth Error" ? "Ready" : p.statusMessage}))}
                    ></div>
                 </div>
             </div>
 
             <div className="p-6 pt-2 space-y-3">
                 <button 
-                   onClick={startProcessing}
-                   disabled={state.step !== AppStep.UPLOAD || (!state.videoFile && !state.youtubeUrl)}
+                   onClick={() => startProcessing()}
+                   disabled={state.step !== AppStep.UPLOAD || state.isProcessing}
                    className="btn-primary w-full py-3.5 rounded-xl text-sm font-bold tracking-wide uppercase shadow-lg disabled:opacity-50 disabled:shadow-none"
                 >
-                   {state.isProcessing ? 'Generating...' : 'Generate Regional Lesson'}
+                   {state.isProcessing ? 'Processing...' : 'Generate Regional Lesson'}
+                </button>
+
+                <button 
+                   onClick={resetApp}
+                   disabled={state.isProcessing}
+                   className="w-full py-2.5 rounded-xl text-xs font-bold tracking-wide uppercase border border-white/10 hover:bg-white/5 transition-colors text-slate-400 hover:text-white"
+                >
+                   Reset Process
                 </button>
                 
                 {state.statusMessage === "Auth Error" && (
-                   <div className="space-y-2">
-                     <p className="text-xs text-red-400 text-center">
-                        Authentication failed. Please check your key.
+                   <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/30 space-y-3">
+                     <p className="text-[11px] text-red-300 text-center leading-relaxed">
+                        Authentication failed. Please check your API key configuration.
                      </p>
-                     <div className="flex gap-2">
-                         <button 
-                           onClick={handleChangeKey}
-                           className="flex-1 py-2 rounded-xl border border-red-400/30 text-red-300 text-xs hover:bg-red-900/20 transition-colors flex items-center justify-center gap-2"
-                         >
-                            Change API Key
-                         </button>
+                     <div className="flex flex-col gap-2">
+                         <div className="flex gap-2">
+                             {typeof (window as any).aistudio !== 'undefined' && (
+                               <button 
+                                 onClick={handleChangeKey}
+                                 className="flex-1 py-2 rounded-lg bg-red-500/20 border border-red-500/30 text-red-200 text-[10px] font-bold hover:bg-red-500/30 transition-colors uppercase tracking-wider"
+                               >
+                                  Select Paid Key
+                               </button>
+                             )}
+                             <button 
+                               onClick={() => setState(p => ({...p, statusMessage: "Ready"}))}
+                               className="flex-1 py-2 rounded-lg border border-white/10 text-slate-400 text-[10px] font-bold hover:bg-white/5 transition-colors uppercase tracking-wider"
+                             >
+                                Dismiss
+                             </button>
+                         </div>
                      </div>
+                   </div>
+                )}
+
+                {["Rate Limit", "Safety Block", "Format Error", "Server Busy", "Network Error", "Failed"].includes(state.statusMessage) && (
+                   <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/30 animate-shake">
+                      <p className="text-[11px] text-red-300 text-center leading-relaxed">
+                         {state.logs[state.logs.length - 1]?.replace("Error: ", "") || "An unexpected error occurred."}
+                      </p>
+                      <button 
+                        onClick={() => setState(p => ({...p, statusMessage: "Ready"}))}
+                        className="w-full mt-2 py-1.5 text-[10px] text-red-400 hover:text-red-300 transition-colors uppercase font-bold tracking-wider"
+                      >
+                         Dismiss
+                      </button>
                    </div>
                 )}
             </div>
@@ -668,9 +1040,11 @@ const App: React.FC = () => {
                    {state.step === AppStep.RESULT && <span className="badge text-[10px] px-2 py-0.5 rounded-full">Ready</span>}
                 </h2>
                 {state.step === AppStep.RESULT && (
-                   <div className="flex gap-2">
-                      <button onClick={() => setPreviewMode('original')} className={`text-xs px-2 py-1 rounded transition-colors ${previewMode === 'original' ? 'bg-white/10 text-white' : 'text-slate-500 hover:text-slate-300'}`}>Original</button>
-                      <button onClick={() => setPreviewMode('dubbed')} className={`text-xs px-2 py-1 rounded transition-colors ${previewMode === 'dubbed' ? 'bg-cyan-500/20 text-cyan-300' : 'text-slate-500 hover:text-slate-300'}`}>AI Dubbed</button>
+                   <div className="flex gap-2 items-center">
+                      <div className="flex gap-1 bg-white/5 p-1 rounded-lg border border-white/5 mr-2">
+                        <button onClick={() => setPreviewMode('original')} className={`text-[10px] uppercase tracking-wider font-bold px-2 py-1 rounded transition-all ${previewMode === 'original' ? 'bg-white/10 text-white shadow-sm' : 'text-slate-500 hover:text-slate-300'}`}>Original</button>
+                        <button onClick={() => setPreviewMode('dubbed')} className={`text-[10px] uppercase tracking-wider font-bold px-2 py-1 rounded transition-all ${previewMode === 'dubbed' ? 'bg-cyan-500/20 text-cyan-300 shadow-sm' : 'text-slate-500 hover:text-slate-300'}`}>AI Dubbed</button>
+                      </div>
                    </div>
                 )}
              </div>
@@ -686,7 +1060,20 @@ const App: React.FC = () => {
                       src={`https://www.youtube.com/embed/${state.youtubeId}?enablejsapi=1&controls=0&modestbranding=1&rel=0&origin=${window.location.origin}`} 
                     />
                  ) : state.videoUrl ? (
-                    <video ref={videoRef} src={state.videoUrl} className="w-full h-full absolute inset-0 object-contain" playsInline muted={false} />
+                    <video 
+                       ref={videoRef} 
+                       src={state.videoUrl} 
+                       className="w-full h-full absolute inset-0 object-contain" 
+                       playsInline 
+                       muted={false} 
+                       onEnded={handlePause}
+                       onTimeUpdate={(e) => {
+                          const t = (e.target as HTMLVideoElement).currentTime;
+                          currentTimeRef.current = t;
+                          setCurrentPlaybackTime(t);
+                       }}
+                       onLoadedMetadata={(e) => setDuration((e.target as HTMLVideoElement).duration)}
+                     />
                  ) : (
                     <div className="text-center p-8">
                        <div className="w-16 h-16 mx-auto rounded-full border border-white/10 flex items-center justify-center mb-4 text-slate-600">
@@ -716,6 +1103,12 @@ const App: React.FC = () => {
                           <div className="h-1.5 w-full bg-slate-800 rounded-full overflow-hidden">
                              <div className="h-full bg-gradient-to-r from-cyan-400 to-violet-500 transition-all duration-300" style={{ width: `${state.progress}%` }}></div>
                           </div>
+                          {state.detectedLanguage && (
+                             <div className="text-center animate-fadeIn">
+                                <span className="text-[10px] text-slate-500 uppercase tracking-widest font-bold block mb-1">Detected Language</span>
+                                <p className="text-cyan-400 font-mono text-sm">{state.detectedLanguage}</p>
+                             </div>
+                          )}
                           <div className="h-32 overflow-hidden relative">
                              <ProcessingLog logs={state.logs} isProcessing={true} />
                           </div>
@@ -809,6 +1202,7 @@ const App: React.FC = () => {
                         </>
                       )}
                     </button>
+
                   </div>
                )}
             </div>
@@ -862,6 +1256,50 @@ const App: React.FC = () => {
             </div>
          </div>
       </footer>
+
+      {/* Settings Modal */}
+      {showSettings && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-6 bg-black/60 backdrop-blur-sm animate-fadeIn">
+           <div className="glass w-full max-w-md rounded-3xl p-8 shadow-2xl border border-white/10">
+              <div className="flex justify-between items-center mb-6">
+                 <h2 className="text-xl font-bold text-white">Settings</h2>
+                 <button onClick={() => setShowSettings(false)} className="text-slate-400 hover:text-white transition-colors">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                 </button>
+              </div>
+
+              <div className="space-y-6">
+                 <div>
+                    <label className="block text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Gemini API Key</label>
+                    <div className="relative">
+                       <input 
+                          type="password"
+                          value={apiKeyInput}
+                          onChange={(e) => setApiKeyInput(e.target.value)}
+                          placeholder="Enter your API Key..."
+                          className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-cyan-500/50 transition-all"
+                       />
+                    </div>
+                    <p className="text-[10px] text-slate-500 mt-2 leading-relaxed">
+                       Get your free API key from <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-cyan-400 hover:underline">Google AI Studio</a>. Your key is stored locally in your browser.
+                    </p>
+                 </div>
+
+                 <button 
+                   onClick={() => {
+                     localStorage.setItem('gemini_api_key', apiKeyInput);
+                     setCustomApiKey(apiKeyInput);
+                     setShowSettings(false);
+                     addLog("API Key saved successfully.");
+                   }}
+                   className="w-full py-3 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 text-white font-bold text-sm shadow-lg shadow-cyan-500/20 hover:scale-[1.02] active:scale-[0.98] transition-all"
+                 >
+                   Save Configuration
+                 </button>
+              </div>
+           </div>
+        </div>
+      )}
     </div>
   );
 };

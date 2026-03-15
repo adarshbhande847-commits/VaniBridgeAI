@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+@layer base {
+  body {
+    @apply bg-[#0b1020] text-slate-100 min-h-screen;
+    background: radial-gradient(1200px 800px at 10% -10%, rgba(111, 76, 255, 0.15), transparent 60%),
+                radial-gradient(1000px 700px at 110% 10%, rgba(0, 229, 255, 0.15), transparent 60%),
+                linear-gradient(180deg, #0b1020 0%, #080c17 100%);
+  }
+}
+
+@layer components {
+  .glass {
+    @apply bg-white/5 backdrop-blur-xl border border-white/10 shadow-2xl;
+  }
+  
+  .btn-primary {
+    @apply bg-gradient-to-br from-cyan-400 to-violet-500 text-slate-900 font-bold transition-all shadow-[0_10px_20px_rgba(103,232,249,0.15)];
+  }
+  
+  .btn-primary:hover:not(:disabled) {
+    @apply -translate-y-0.5 scale-[1.01] shadow-[0_14px_24px_rgba(103,232,249,0.25)];
+  }
+  
+  .btn-primary:active:not(:disabled) {
+    @apply translate-y-0;
+  }
+
+  .field {
+    @apply bg-black/20 border border-white/10 text-slate-100 transition-all focus:border-cyan-400/50 focus:ring-4 focus:ring-cyan-400/10 outline-none;
+  }
+
+  .dropzone {
+    @apply border-2 border-dashed border-white/15 transition-all hover:border-white/30 hover:bg-white/5;
+  }
+
+  .toggle {
+    @apply relative w-11 h-6 bg-white/10 rounded-full transition-all cursor-pointer;
+  }
+
+  .toggle::after {
+    content: "";
+    @apply absolute top-0.5 left-0.5 w-5 h-5 bg-slate-400 rounded-full transition-all shadow-md;
+  }
+
+  .toggle.active {
+    @apply bg-cyan-400/20 border border-cyan-400/30;
+  }
+
+  .toggle.active::after {
+    @apply left-[22px] bg-cyan-400;
+  }
+
+  .halftone {
+    background-image: radial-gradient(circle at 1px 1px, rgba(255,255,255,0.05) 1px, transparent 0);
+    background-size: 24px 24px;
+  }
+
+  .status-dot {
+    @apply w-2 h-2 rounded-full inline-block mr-2;
+  }
+  
+  .status-dot.live {
+    @apply bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.4)];
+  }
+  
+  .status-dot.processing {
+    @apply bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.4)];
+  }
+}

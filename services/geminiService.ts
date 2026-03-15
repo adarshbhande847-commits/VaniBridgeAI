@@ -1,7 +1,33 @@
 import { GoogleGenAI, Modality } from "@google/genai";
 
 // Use a function to ensure we always get the latest API key (e.g., after user selection)
-const getAI = () => new GoogleGenAI({ apiKey: process.env.API_KEY });
+let customApiKey: string | null = null;
+export const setCustomApiKey = (key: string) => { customApiKey = key; };
+
+const getAI = () => {
+  const key = customApiKey || process.env.API_KEY;
+  if (!key) {
+    throw new Error("Gemini API Key is missing. Please provide one in Settings.");
+  }
+  return new GoogleGenAI({ apiKey: key });
+};
+
+/**
+ * Helper for exponential backoff retries on 429 errors
+ */
+const withRetry = async <T>(fn: () => Promise<T>, retries = 3, delay = 2000): Promise<T> => {
+  try {
+    return await fn();
+  } catch (error) {
+    const errMsg = (error as Error).message.toLowerCase();
+    if ((errMsg.includes("429") || errMsg.includes("rate limit") || errMsg.includes("quota")) && retries > 0) {
+      console.log(`Rate limit hit, retrying in ${delay}ms... (${retries} retries left)`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return withRetry(fn, retries - 1, delay * 2);
+    }
+    throw error;
+  }
+};
 
 /**
  * Helper to convert File to Base64
@@ -30,7 +56,7 @@ export const detectAndTranscribe = async (file: File): Promise<{ language: strin
   const ai = getAI();
   const videoPart = await fileToGenerativePart(file);
 
-  const response = await ai.models.generateContent({
+  const response = await withRetry(() => ai.models.generateContent({
     model: 'gemini-3-flash-preview',
     contents: {
       parts: [
@@ -41,7 +67,7 @@ export const detectAndTranscribe = async (file: File): Promise<{ language: strin
     config: {
       responseMimeType: "application/json"
     }
-  });
+  }));
 
   const text = response.text || "{}";
   try {
@@ -57,35 +83,43 @@ export const detectAndTranscribe = async (file: File): Promise<{ language: strin
 };
 
 /**
- * Step 1b: Analyze YouTube URL (Fallback when download fails)
+ * Step 1b: Analyze URL (YouTube or direct MP4)
  */
-export const analyzeYouTubeUrl = async (url: string): Promise<{ language: string; transcript: string }> => {
+export const analyzeUrl = async (url: string): Promise<{ language: string; transcript: string }> => {
   const ai = getAI();
+  const isMp4 = url.toLowerCase().endsWith('.mp4');
+  
   try {
-    const response = await ai.models.generateContent({
+    const response = await withRetry(() => ai.models.generateContent({
       model: 'gemini-3-flash-preview',
       contents: {
         parts: [
-          { text: `I have a YouTube video URL: ${url}. 
+          { text: `I have a video URL: ${url}. 
+            ${isMp4 ? "This is a direct link to an MP4 video file." : "This is a YouTube video link."}
+            
             Task:
-            1. Use Google Search to find the EXACT transcript or captions for this video.
-            2. If a direct transcript isn't available, find detailed summaries, video descriptions, or articles about this specific video.
-            3. Detect the primary spoken language.
-            4. Generate a Comprehensive Transcript:
+            1. Use Google Search to find information about this video.
+            2. If it's a YouTube video, find the EXACT transcript or captions.
+            3. If it's a direct MP4 link, search for the source website, title, or any context that provides a transcript or detailed description.
+            4. Detect the primary spoken language.
+            5. Check if the video is accessible (not private, deleted, or region-restricted).
+            6. Generate a Comprehensive Transcript:
                - The transcript MUST be a word-for-word or highly detailed narrative of everything said in the video.
                - It should be structured as a continuous educational lecture.
                - Length should be proportional to the video's duration (aim for at least 300-500 words for standard educational videos).
                - DO NOT summarize. Provide the actual spoken content.
                - If you cannot find the exact words, reconstruct the lecture based on the video's specific content and title with high fidelity.
             
-            Return a JSON object with keys 'language' and 'transcript'. Do not add Markdown code blocks.` }
+            Return a JSON object with keys 'language', 'transcript', and 'status' (value: 'success' or 'error'). 
+            If 'status' is 'error', include an 'errorMessage' explaining why (e.g., 'Private Video', 'Region Restricted', 'Invalid URL').
+            Do not add Markdown code blocks.` }
         ]
       },
       config: {
         tools: [{ googleSearch: {} }],
         responseMimeType: "application/json"
       }
-    });
+    }));
 
     const text = response.text || "{}";
     const cleanText = text.replace(/```json\n?|```/g, '').trim();
@@ -94,11 +128,15 @@ export const analyzeYouTubeUrl = async (url: string): Promise<{ language: string
     try {
         json = JSON.parse(cleanText);
     } catch (e) {
-        throw new Error("Failed to parse transcript from YouTube analysis.");
+        throw new Error("Failed to parse transcript from URL analysis.");
+    }
+
+    if (json.status === 'error') {
+        throw new Error(json.errorMessage || "Could not retrieve video details.");
     }
 
     if (!json.transcript || json.transcript.includes("Could not retrieve")) {
-        throw new Error("Could not retrieve a valid transcript for this YouTube video.");
+        throw new Error("Could not retrieve a valid transcript for this video. The video might be private, deleted, or restricted.");
     }
 
     return {
@@ -106,17 +144,19 @@ export const analyzeYouTubeUrl = async (url: string): Promise<{ language: string
        transcript: json.transcript
     };
   } catch (error) {
-    // Check for critical auth errors and rethrow them so the UI can prompt for a new key
     const errMsg = (error as Error).message.toLowerCase();
-    if (errMsg.includes("permission denied") || 
-        errMsg.includes("403") || 
-        errMsg.includes("not found") || 
-        errMsg.includes("authentication failed") ||
-        errMsg.includes("api key")) {
-        throw error;
+    
+    // Provide user-friendly guidance based on common errors
+    if (errMsg.includes("private") || errMsg.includes("deleted") || errMsg.includes("restricted")) {
+        throw new Error(`Video Inaccessible: ${error instanceof Error ? error.message : 'The video is private or restricted.'} Try using 'Mock Mode' or uploading a direct MP4 file.`);
     }
-    console.error("YouTube Analysis Error:", error);
-    throw error;
+    
+    if (errMsg.includes("permission denied") || errMsg.includes("403") || errMsg.includes("api key")) {
+        throw error; // Rethrow auth errors for UI handling
+    }
+    
+    console.error("URL Analysis Error:", error);
+    throw new Error(`URL Analysis Failed: ${error instanceof Error ? error.message : 'Unknown error'}. Please check the URL or try uploading a file.`);
   }
 };
 
@@ -124,31 +164,14 @@ export const analyzeYouTubeUrl = async (url: string): Promise<{ language: string
  * Step 1c: Generate Generic Transcript (Mock/Simulated)
  */
 export const generateGenericTranscript = async (): Promise<{ language: string; transcript: string }> => {
-  const ai = getAI();
   const topics = ["The Water Cycle", "Photosynthesis", "Gravity", "The Solar System", "Volcanoes", "Ocean Currents", "Atoms"];
   const randomTopic = topics[Math.floor(Math.random() * topics.length)];
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3-flash-preview',
-    contents: {
-      parts: [
-        { text: `Write a **detailed and comprehensive** educational transcript explaining ${randomTopic} to a student. It should be substantial (at least 200 words). Return a JSON object with keys 'language' (value: 'English') and 'transcript' (the text).` }
-      ]
-    },
-    config: {
-      responseMimeType: "application/json"
-    }
-  });
-
-  const text = response.text || "{}";
-  try {
-     return JSON.parse(text);
-  } catch(e) {
-     return { 
-       language: "English", 
-       transcript: "Science helps us understand the world around us. From the smallest atoms to the largest galaxies, everything is connected." 
-     };
-  }
+  // Truly local mock to avoid API errors in mock mode
+  return { 
+    language: "English", 
+    transcript: `Science helps us understand the world around us. From the smallest atoms to the largest galaxies, everything is connected. In this lesson, we explore ${randomTopic} in detail, covering its fundamental principles and real-world applications. This topic is essential for understanding how our universe functions and how different systems interact with each other to maintain balance in nature.` 
+  };
 };
 
 /**
@@ -156,14 +179,25 @@ export const generateGenericTranscript = async (): Promise<{ language: string; t
  */
 export const translateText = async (text: string, targetLang: string, sourceLang: string): Promise<string> => {
   const ai = getAI();
-  const response = await ai.models.generateContent({
-    model: 'gemini-3-flash-preview',
+  const response = await withRetry(() => ai.models.generateContent({
+    model: 'gemini-3-flash-preview', // Use flash for higher rate limits (15 RPM vs 2 RPM)
     contents: {
       parts: [
-        { text: `Translate the following ${sourceLang} text to ${targetLang}. Ensure the tone is educational and suitable for rural audiences. Return ONLY the translated text. Do not summarize; translate the full text.\n\nText: "${text}"` }
+        { text: `You are an expert translator specializing in educational content for rural communities. 
+        Task: Translate the following ${sourceLang} text into ${targetLang}.
+        
+        Guidelines:
+        1. Maintain the original educational meaning and technical accuracy.
+        2. Use culturally appropriate idioms and terminology that a rural audience in India would easily understand.
+        3. Ensure the tone is encouraging, clear, and respectful.
+        4. Do NOT summarize. Translate the entire text word-for-word where possible, while ensuring natural flow in ${targetLang}.
+        5. Return ONLY the translated text.
+        
+        Text to translate:
+        "${text}"` }
       ]
     }
-  });
+  }));
 
   return response.text || "";
 };
@@ -173,7 +207,7 @@ export const translateText = async (text: string, targetLang: string, sourceLang
  */
 export const generateSpeechData = async (text: string, voiceName: string = 'Puck'): Promise<ArrayBuffer> => {
    const ai = getAI();
-   const response = await ai.models.generateContent({
+   const response = await withRetry(() => ai.models.generateContent({
     model: "gemini-2.5-flash-preview-tts",
     contents: [{ parts: [{ text: text }] }],
     config: {
@@ -184,7 +218,7 @@ export const generateSpeechData = async (text: string, voiceName: string = 'Puck
         },
       },
     },
-  });
+  }));
 
   const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
   if (!base64Audio) throw new Error("No audio data returned");

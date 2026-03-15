@@ -1,0 +1,57 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: lessons
+    // Fields:
+    //   - uid: string (required) - Owner's UID
+    //   - title: string (required) - Lesson title
+    //   - sourceUrl: string (optional) - Original URL
+    //   - targetLanguage: string (required) - Target language
+    //   - transcript: string (optional) - Original text
+    //   - translatedText: string (optional) - Translated text
+    //   - audioUrl: string (optional) - Audio metadata
+    //   - createdAt: timestamp (required) - Creation time
+    //
+    // ===============================================================
+
+    // Helper Functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.uid;
+    }
+
+    function isValidLesson(data) {
+      return data.keys().hasAll(['uid', 'title', 'targetLanguage', 'createdAt']) &&
+             data.uid is string && data.uid == request.auth.uid &&
+             data.title is string && data.title.size() > 0 && data.title.size() < 500 &&
+             data.targetLanguage is string &&
+             data.createdAt is timestamp;
+    }
+
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Lessons Collection
+    match /lessons/{lessonId} {
+      allow read: if isDocOwner();
+      allow create: if isAuthenticated() && isValidLesson(request.resource.data);
+      allow update: if isDocOwner() && isValidLesson(request.resource.data) && 
+                      request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if isDocOwner();
+    }
+  }
+}

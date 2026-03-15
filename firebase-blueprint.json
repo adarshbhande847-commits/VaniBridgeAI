@@ -1,0 +1,51 @@
+{
+  "entities": {
+    "Lesson": {
+      "title": "Lesson",
+      "description": "A localized educational video lesson.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "The user ID of the creator."
+        },
+        "title": {
+          "type": "string",
+          "description": "The title of the lesson."
+        },
+        "sourceUrl": {
+          "type": "string",
+          "description": "The original video URL."
+        },
+        "targetLanguage": {
+          "type": "string",
+          "description": "The language the video was localized into."
+        },
+        "transcript": {
+          "type": "string",
+          "description": "The original transcript."
+        },
+        "translatedText": {
+          "type": "string",
+          "description": "The translated transcript."
+        },
+        "audioUrl": {
+          "type": "string",
+          "description": "The URL of the generated AI audio (if stored, otherwise metadata)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the lesson was created."
+        }
+      },
+      "required": ["uid", "title", "targetLanguage", "createdAt"]
+    }
+  },
+  "firestore": {
+    "lessons/{lessonId}": {
+      "schema": "Lesson",
+      "description": "Collection of localized lessons."
+    }
+  }
+}

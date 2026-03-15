@@ -4,125 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>VaniBridge: Bridging the Language Gap</title>
-    <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-      :root {
-        --bg: #0b1020;
-        --card: rgba(255,255,255,0.03);
-        --border: rgba(255,255,255,0.08);
-        --accent: #6ee7f0;
-        --accent-2: #a78bfa;
-        --text: #f8fafc;
-        --muted: #94a3b8;
-        --success: #34d399;
-        --warning: #fbbf24;
-        --danger: #f87171;
-      }
-      body {
-        font-family: 'Inter', sans-serif;
-        background: radial-gradient(1200px 800px at 10% -10%, rgba(111, 76, 255, 0.15), transparent 60%),
-                    radial-gradient(1000px 700px at 110% 10%, rgba(0, 229, 255, 0.15), transparent 60%),
-                    linear-gradient(180deg, #0b1020 0%, #080c17 100%);
-        color: var(--text);
-        min-height: 100vh;
-      }
-      .glass {
-        background: var(--card);
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
-        border: 1px solid var(--border);
-        box-shadow: 0 10px 30px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.05);
-      }
-      .btn-primary {
-        background: linear-gradient(135deg, var(--accent), var(--accent-2));
-        color: #0b1020;
-        font-weight: 700;
-        transition: transform .15s ease, box-shadow .2s ease, opacity .2s ease;
-        box-shadow: 0 10px 20px rgba(103, 232, 249, 0.15), 0 6px 14px rgba(167, 139, 250, 0.1);
-      }
-      .btn-primary:hover:not(:disabled) { transform: translateY(-1px) scale(1.01); box-shadow: 0 14px 24px rgba(103, 232, 249, 0.25); }
-      .btn-primary:active:not(:disabled) { transform: translateY(0); }
-      .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; filter: grayscale(0.8); }
-      
-      .badge {
-        background: linear-gradient(135deg, rgba(110,231,240,.1), rgba(167,139,250,.1));
-        border: 1px solid rgba(255,255,255,0.1);
-        color: #e2e8f0;
-      }
-      .field {
-        background: rgba(0,0,0,0.2);
-        border: 1px solid var(--border);
-        color: var(--text);
-        transition: border .2s ease, box-shadow .2s ease;
-      }
-      .field:focus {
-        border-color: rgba(110,231,240,.5);
-        box-shadow: 0 0 0 4px rgba(110,231,240,.1);
-        outline: none;
-      }
-      .dropzone {
-        border: 1.5px dashed rgba(255,255,255,0.15);
-        transition: border .2s ease, background .2s ease, transform .2s ease;
-      }
-      .dropzone:hover {
-        border-color: rgba(255,255,255,0.3);
-        background: rgba(255,255,255,0.02);
-      }
-      .dropzone.dragover {
-        border-color: var(--accent);
-        background: rgba(110,231,240,0.05);
-        transform: scale(0.99);
-      }
-      .halftone {
-        background-image: radial-gradient(circle at 1px 1px, rgba(255,255,255,0.05) 1px, transparent 0);
-        background-size: 24px 24px;
-      }
-      .toggle {
-        position: relative;
-        width: 44px;
-        height: 24px;
-        background: rgba(255,255,255,0.1);
-        border-radius: 999px;
-        transition: background .2s ease;
-        cursor: pointer;
-      }
-      .toggle::after {
-        content: "";
-        position: absolute;
-        top: 2px;
-        left: 2px;
-        width: 20px;
-        height: 20px;
-        background: #94a3b8;
-        border-radius: 50%;
-        transition: left .2s ease, background .2s ease;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-      }
-      .toggle.active {
-        background: rgba(110,231,240,0.2);
-        border: 1px solid rgba(110,231,240,0.3);
-      }
-      .toggle.active::after {
-        left: 22px;
-        background: var(--accent);
-      }
-      .status-dot {
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        display: inline-block;
-        margin-right: 6px;
-      }
-      .status-dot.live { background: var(--success); box-shadow: 0 0 0 4px rgba(52,211,153,0.1); }
-      .status-dot.processing { background: var(--warning); box-shadow: 0 0 0 4px rgba(251,191,36,0.1); }
-      
-      /* Custom scrollbar */
-      ::-webkit-scrollbar { width: 6px; height: 6px; }
-      ::-webkit-scrollbar-track { background: transparent; }
-      ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
-      ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
-    </style>
   <script type="importmap">
 {
   "imports": {
@@ -133,7 +15,6 @@
   }
 }
 </script>
-<link rel="stylesheet" href="/index.css">
 </head>
   <body>
     <div id="root"></div>
